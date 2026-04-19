@@ -4,3 +4,6 @@ tmp/
 *.log
 *.json
 *.bak*
+
+config/
+*.bak*
