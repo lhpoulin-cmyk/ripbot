@@ -1,0 +1,3 @@
+RIP_DEVICE="/dev/sr1"
+MEDIA_PATH="/path/to/media"
+CONFIDENCE_THRESHOLD="0.85"
