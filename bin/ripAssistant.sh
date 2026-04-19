@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ripAssistant.sh
 #
+# Version: 0.2 alpha
+#
 # Phase 1:
 #   - Detect disc in a target drive
 #   - Probe MakeMKV title info
@@ -11,7 +13,8 @@
 #   - Produce a confidence score and AI-ready summary payload
 #
 # Phase 3:
-#   - If confidence >= threshold, rip only candidate titles
+#   - If confidence >= threshold, rip candidate titles
+#   - Preserve equal duplicates as neutral variants
 #   - If confidence is too low, stop and ask for review
 #
 # Assumption:
@@ -24,6 +27,9 @@
 #   - Movie-mode support can be added later.
 
 set -euo pipefail
+shopt -s nullglob
+
+SCRIPT_VERSION="0.2.1 alpha"
 
 ########################################
 # Defaults
@@ -35,13 +41,15 @@ SHOW_NAME="UNKNOWN_SHOW"
 SEASON="01"
 DISC_LABEL_OVERRIDE=""
 MODE="tv"                         # tv | movie
-MIN_EPISODE_SECONDS=$((15*60))    # lower bound for episodic content
-MAX_EPISODE_SECONDS=$((35*60))    # upper bound for episodic content
+MIN_EPISODE_SECONDS=0            # mode defaults applied later unless overridden
+MAX_EPISODE_SECONDS=0            # mode defaults applied later unless overridden
 CONFIDENCE_THRESHOLD=0.80
 VERBOSITY=2                       # 0=errors only, 1=normal, 2=verbose, 3=debug
 DRY_RUN=0
 FORCE_RIP=0
 KEEP_PROBE_FILE=1
+CUSTOM_MIN_EPISODE_SECONDS=0
+CUSTOM_MAX_EPISODE_SECONDS=0
 
 ########################################
 # Logging
@@ -140,10 +148,10 @@ while [[ $# -gt 0 ]]; do
       MODE="$2"; shift 2
       ;;
     --min-episode-seconds)
-      MIN_EPISODE_SECONDS="$2"; shift 2
+      MIN_EPISODE_SECONDS="$2"; CUSTOM_MIN_EPISODE_SECONDS=1; shift 2
       ;;
     --max-episode-seconds)
-      MAX_EPISODE_SECONDS="$2"; shift 2
+      MAX_EPISODE_SECONDS="$2"; CUSTOM_MAX_EPISODE_SECONDS=1; shift 2
       ;;
     --confidence-threshold)
       CONFIDENCE_THRESHOLD="$2"; shift 2
@@ -170,6 +178,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 (( VERBOSITY < 0 )) && VERBOSITY=0
+
+########################################
+# Mode defaults
+########################################
+
+if [[ "${MODE}" == "tv" ]]; then
+  (( CUSTOM_MIN_EPISODE_SECONDS == 0 )) && MIN_EPISODE_SECONDS=$((20*60))
+  (( CUSTOM_MAX_EPISODE_SECONDS == 0 )) && MAX_EPISODE_SECONDS=$((75*60))
+elif [[ "${MODE}" == "movie" ]]; then
+  (( CUSTOM_MIN_EPISODE_SECONDS == 0 )) && MIN_EPISODE_SECONDS=$((60*60))
+  (( CUSTOM_MAX_EPISODE_SECONDS == 0 )) && MAX_EPISODE_SECONDS=$((4*60*60))
+else
+  die "Unsupported mode: ${MODE} (expected tv or movie)"
+fi
 
 ########################################
 # Preconditions
@@ -213,6 +235,16 @@ json_escape() {
   sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+variant_suffix() {
+  local idx="$1"
+  local letters=(alpha beta gamma delta epsilon zeta eta theta iota kappa)
+  if (( idx >= 0 && idx < ${#letters[@]} )); then
+    printf '%s\n' "${letters[$idx]}"
+  else
+    printf 'variant%02d\n' "$((idx + 1))"
+  fi
+}
+
 ########################################
 # Probe disc
 ########################################
@@ -222,6 +254,7 @@ TMPDIR="$(mktemp -d)"
 PROBE_FILE="${TMPDIR}/probe.txt"
 SUMMARY_FILE="${TMPDIR}/summary.json"
 
+log_info "ripAssistant ${SCRIPT_VERSION}"
 log_info "Probing disc in ${DEVICE}"
 log_verbose "Temporary working directory: ${TMPDIR}"
 
@@ -237,14 +270,44 @@ log_verbose "Probe complete"
 ########################################
 
 DISC_LABEL="$(
-  awk -F'"' '/^DRV:/ && $6 != "" { print $6; exit }' "${PROBE_FILE}" | sed 's/^ *//; s/ *$//'
+  awk -F'"' '
+    function accept_label(v) {
+      return (v != "" && v !~ /^\/dev\// && v !~ /^[0-9]+$/)
+    }
+    /^CINFO:/ {
+      split($1, a, /[:,]/)
+      key=a[2]
+      val=$2
+      if ((key == 2 || key == 30 || key == 32) && accept_label(val) && cinfo == "") {
+        cinfo=val
+      }
+      next
+    }
+    /^DRV:/ {
+      if (drv == "") {
+        for (i=2; i<=NF; i+=2) {
+          val=$i
+          if (!accept_label(val)) continue
+          drv=val
+          break
+        }
+      }
+      next
+    }
+    END {
+      if (cinfo != "") print cinfo
+      else if (drv != "") print drv
+    }
+  ' "${PROBE_FILE}" | sed 's/^ *//; s/ *$//'
 )"
 
 if [[ -n "${DISC_LABEL_OVERRIDE}" ]]; then
   DISC_LABEL="${DISC_LABEL_OVERRIDE}"
 fi
 
-[[ -n "${DISC_LABEL}" ]] || DISC_LABEL="UNLABELED_DISC"
+if [[ -z "${DISC_LABEL}" || "${DISC_LABEL}" =~ ^/?dev/ || "${DISC_LABEL}" =~ ^-?dev- ]]; then
+  DISC_LABEL="UNLABELED_DISC"
+fi
 DISC_LABEL="$(sanitize_name "${DISC_LABEL}")"
 
 log_info "Disc label: ${DISC_LABEL}"
@@ -330,6 +393,55 @@ log_verbose "Short titles: ${SHORT_COUNT}"
 log_verbose "Long titles: ${LONG_COUNT}"
 
 ########################################
+# Candidate clustering preview
+#
+# Before confidence scoring, estimate whether the candidate set contains
+# a dominant duration cluster plus a likely outlier playlist.
+########################################
+
+DOMINANT_CLUSTER_COUNT=0
+DOMINANT_CLUSTER_REF_TID=""
+OUTLIER_CANDIDATE_COUNT=0
+
+if (( CANDIDATE_COUNT > 0 )); then
+  declare -a PREVIEW_GROUP_KEYS=()
+  declare -A PREVIEW_GROUP_MEMBERS=()
+  declare -A PREVIEW_GROUP_REFSEC=()
+
+  for tid in "${CANDIDATE_TITLES[@]}"; do
+    placed=0
+    sec="${TITLE_DURATION_SEC[$tid]}"
+
+    for group_key in "${PREVIEW_GROUP_KEYS[@]}"; do
+      ref_sec="${PREVIEW_GROUP_REFSEC[$group_key]}"
+      diff=$(( sec - ref_sec ))
+      (( diff < 0 )) && diff=$(( -diff ))
+      if (( diff <= 30 )); then
+        PREVIEW_GROUP_MEMBERS["$group_key"]+=" $tid"
+        placed=1
+        break
+      fi
+    done
+
+    if (( placed == 0 )); then
+      PREVIEW_GROUP_KEYS+=("$tid")
+      PREVIEW_GROUP_REFSEC["$tid"]="$sec"
+      PREVIEW_GROUP_MEMBERS["$tid"]="$tid"
+    fi
+  done
+
+  for group_key in "${PREVIEW_GROUP_KEYS[@]}"; do
+    read -r -a group_members <<< "${PREVIEW_GROUP_MEMBERS[$group_key]}"
+    if (( ${#group_members[@]} > DOMINANT_CLUSTER_COUNT )); then
+      DOMINANT_CLUSTER_COUNT=${#group_members[@]}
+      DOMINANT_CLUSTER_REF_TID="$group_key"
+    fi
+  done
+
+  OUTLIER_CANDIDATE_COUNT=$(( CANDIDATE_COUNT - DOMINANT_CLUSTER_COUNT ))
+fi
+
+########################################
 # Confidence scoring
 #
 # TV heuristics:
@@ -382,12 +494,22 @@ if [[ "${MODE}" == "tv" ]]; then
   if (( LONG_COUNT >= 2 )); then
     score=$((score - 15))
     REASONING+=("Multiple long titles increase ambiguity")
+  elif (( LONG_COUNT == 1 )); then
+    REASONING+=("One longer playlist remains outside the main candidate range")
   fi
 
   # Penalty: no short titles is unusual but not fatal; lots of shorts is normal
   if (( CANDIDATE_COUNT <= 2 )); then
     score=$((score - 30))
     REASONING+=("Too few episode-length titles")
+  fi
+
+  if (( DOMINANT_CLUSTER_COUNT >= 2 )); then
+    score=$((score + 12))
+    REASONING+=("Detected a repeated runtime cluster among candidate titles")
+    if (( OUTLIER_CANDIDATE_COUNT == 1 )); then
+      REASONING+=("One candidate appears to be an outlier playlist relative to the dominant cluster")
+    fi
   fi
 
   # Tight cluster bonus
@@ -409,8 +531,12 @@ if [[ "${MODE}" == "tv" ]]; then
       score=$((score + 8))
       REASONING+=("Episode candidates form a reasonable duration cluster")
     else
-      score=$((score - 10))
-      REASONING+=("Episode candidates are duration-diverse; possible ambiguity")
+      if (( DOMINANT_CLUSTER_COUNT >= 2 && OUTLIER_CANDIDATE_COUNT <= 1 )); then
+        REASONING+=("Candidate spread is driven mostly by a single outlier, not by broad inconsistency")
+      else
+        score=$((score - 10))
+        REASONING+=("Episode candidates are duration-diverse; possible ambiguity")
+      fi
     fi
   fi
 
@@ -427,12 +553,60 @@ else
 fi
 
 ########################################
+# Duplicate-aware grouping
+#
+# Candidate titles with near-identical runtimes are treated as
+# equal variants of the same logical episode slot.
+########################################
+
+declare -a RIP_GROUP_KEYS=()
+declare -A RIP_GROUP_MEMBERS=()
+declare -A RIP_GROUP_REFSEC=()
+
+for tid in "${CANDIDATE_TITLES[@]}"; do
+  placed=0
+
+  for group_key in "${RIP_GROUP_KEYS[@]}"; do
+    ref_sec="${RIP_GROUP_REFSEC[$group_key]}"
+    sec="${TITLE_DURATION_SEC[$tid]}"
+    diff=$(( sec - ref_sec ))
+    (( diff < 0 )) && diff=$(( -diff ))
+
+    if (( diff <= 30 )); then
+      RIP_GROUP_MEMBERS["$group_key"]+=" $tid"
+      placed=1
+      break
+    fi
+  done
+
+  if (( placed == 0 )); then
+    RIP_GROUP_KEYS+=("$tid")
+    RIP_GROUP_REFSEC["$tid"]="${TITLE_DURATION_SEC[$tid]}"
+    RIP_GROUP_MEMBERS["$tid"]="$tid"
+  fi
+done
+
+GROUP_COUNT="${#RIP_GROUP_KEYS[@]}"
+DUPLICATE_GROUP_COUNT=0
+for group_key in "${RIP_GROUP_KEYS[@]}"; do
+  read -r -a group_members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+  if (( ${#group_members[@]} > 1 )); then
+    DUPLICATE_GROUP_COUNT=$((DUPLICATE_GROUP_COUNT + 1))
+  fi
+done
+
+if (( DUPLICATE_GROUP_COUNT > 0 )); then
+  REASONING+=("Near-identical candidate runtimes were grouped as equal variants")
+fi
+
+########################################
 # AI-ready summary payload
 ########################################
 
 {
   echo "{"
   printf '  "timestamp": "%s",\n' "${TIMESTAMP}"
+  printf '  "script_version": "%s",\n' "${SCRIPT_VERSION}"
   printf '  "device": "%s",\n' "${DEVICE}"
   printf '  "disc_label": "%s",\n' "$(printf '%s' "${DISC_LABEL}" | json_escape)"
   printf '  "mode": "%s",\n' "${MODE}"
@@ -455,6 +629,25 @@ fi
   done
   echo '  ],'
 
+  echo '  "title_groups": ['
+  for i in "${!RIP_GROUP_KEYS[@]}"; do
+    group_key="${RIP_GROUP_KEYS[$i]}"
+    read -r -a group_members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+    comma=","
+    [[ "$i" -eq $((${#RIP_GROUP_KEYS[@]} - 1)) ]] && comma=""
+
+    printf '    {"group_leader": %s, "members": [' "$group_key"
+    for j in "${!group_members[@]}"; do
+      member="${group_members[$j]}"
+      member_comma=","
+      [[ "$j" -eq $((${#group_members[@]} - 1)) ]] && member_comma=""
+      printf '%s%s' "$member" "$member_comma"
+    done
+    printf '], "duration": "%s"}%s
+' "${TITLE_DURATION_HMS[$group_key]}" "$comma"
+  done
+  echo '  ],'
+
   echo '  "reasoning": ['
   for i in "${!REASONING[@]}"; do
     comma=","
@@ -474,6 +667,7 @@ echo "========== DISC SUMMARY =========="
 echo "Device:              ${DEVICE}"
 echo "Disc label:          ${DISC_LABEL}"
 echo "Mode:                ${MODE}"
+echo "Version:             ${SCRIPT_VERSION}"
 echo "Total titles:        ${TOTAL_TITLES}"
 echo "Candidate titles:    ${CANDIDATE_COUNT}"
 echo "Short titles:        ${SHORT_COUNT}"
@@ -489,6 +683,19 @@ for tid in "${CANDIDATE_TITLES[@]}"; do
     "$tid" \
     "${TITLE_DURATION_HMS[$tid]}" \
     "${TITLE_SIZE[$tid]}"
+done
+
+echo
+echo "Logical title groups:"
+for group_key in "${RIP_GROUP_KEYS[@]}"; do
+  read -r -a group_members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+  if (( ${#group_members[@]} > 1 )); then
+    printf '  - variants | %s | titles: %s
+'       "${TITLE_DURATION_HMS[$group_key]}"       "${RIP_GROUP_MEMBERS[$group_key]}"
+  else
+    printf '  - single   | %s | title: %s
+'       "${TITLE_DURATION_HMS[$group_key]}"       "$group_key"
+  fi
 done
 
 echo
@@ -541,6 +748,76 @@ else
   fi
 fi
 
+prompt_for_duplicates=0
+dominant_group=""
+dominant_size=0
+
+# Find largest group
+for group_key in "${RIP_GROUP_KEYS[@]}"; do
+  read -r -a members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+  if (( ${#members[@]} > dominant_size )); then
+    dominant_size=${#members[@]}
+    dominant_group="$group_key"
+  fi
+done
+
+# Check if dominant group is a duplicate cluster
+if (( dominant_size >= 2 )); then
+  other_groups=0
+  for group_key in "${RIP_GROUP_KEYS[@]}"; do
+    [[ "$group_key" == "$dominant_group" ]] && continue
+    read -r -a members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+    if (( ${#members[@]} >= 1 )); then
+      other_groups=$((other_groups + 1))
+    fi
+  done
+
+  # Only trigger if others are singletons
+  if (( other_groups >= 1 )); then
+    prompt_for_duplicates=1
+  fi
+fi
+
+if [[ "${should_rip}" -ne 1 && "${prompt_for_duplicates}" -eq 1 ]]; then
+  echo
+  echo "Review action required."
+  echo
+  echo "Detected duplicate runtime cluster:"
+  printf '  - %s | titles: %s\n' \
+    "${TITLE_DURATION_HMS[$dominant_group]}" \
+    "${RIP_GROUP_MEMBERS[$dominant_group]}"
+  echo
+  echo "Suggested action:"
+  echo "  Rip duplicate cluster only and preserve both variants."
+  echo
+  echo "Press ENTER to proceed with suggested action."
+  echo "[a] rip all candidates"
+  echo "[n] abort"
+  printf "> "
+
+  read -r choice
+
+  case "$choice" in
+    "" )
+      log_info "Proceeding with duplicate cluster only"
+      CANDIDATE_TITLES=()
+      read -r -a cluster_members <<< "${RIP_GROUP_MEMBERS[$dominant_group]}"
+      for tid in "${cluster_members[@]}"; do
+        CANDIDATE_TITLES+=("$tid")
+      done
+      should_rip=1
+      ;;
+    a|A )
+      log_info "Proceeding with all candidates"
+      should_rip=1
+      ;;
+    * )
+      log_info "Aborting by user choice"
+      exit 2
+      ;;
+  esac
+fi
+
 if [[ "${should_rip}" -ne 1 ]]; then
   log_info "Confidence below threshold; not ripping"
   log_info "Review summary: ${SUMMARY_FILE}"
@@ -553,14 +830,45 @@ mkdir -p "${DEST_DIR}"
 
 log_info "Rip approved"
 log_info "Destination: ${DEST_DIR}"
-log_info "Beginning rip of ${CANDIDATE_COUNT} titles"
+log_info "Beginning rip of ${CANDIDATE_COUNT} titles across ${GROUP_COUNT} logical groups"
 
 ripped_count=0
-for tid in "${CANDIDATE_TITLES[@]}"; do
-  log_info "Ripping title ${tid} (${TITLE_DURATION_HMS[$tid]}, ${TITLE_SIZE[$tid]})"
-  makemkvcon mkv "dev:${DEVICE}" "${tid}" "${DEST_DIR}"
-  ripped_count=$((ripped_count + 1))
-  log_verbose "Completed title ${tid}"
+for group_index in "${!RIP_GROUP_KEYS[@]}"; do
+  group_key="${RIP_GROUP_KEYS[$group_index]}"
+  read -r -a group_members <<< "${RIP_GROUP_MEMBERS[$group_key]}"
+
+  if (( ${#group_members[@]} == 1 )); then
+    tid="${group_members[0]}"
+    log_info "Ripping title ${tid} (${TITLE_DURATION_HMS[$tid]}, ${TITLE_SIZE[$tid]})"
+    makemkvcon mkv "dev:${DEVICE}" "${tid}" "${DEST_DIR}"
+    ripped_count=$((ripped_count + 1))
+    log_verbose "Completed title ${tid}"
+    continue
+  fi
+
+  log_info "Ripping duplicate cluster for logical slot $((group_index + 1)) (${TITLE_DURATION_HMS[$group_key]})"
+  variant_index=0
+  for tid in "${group_members[@]}"; do
+    tmp_title_dir="${TMPDIR}/rip_title_${tid}_${TIMESTAMP}"
+    mkdir -p "${tmp_title_dir}"
+
+    log_info "Ripping title ${tid} as equal variant $(variant_suffix "${variant_index}")"
+    makemkvcon mkv "dev:${DEVICE}" "${tid}" "${tmp_title_dir}"
+
+    ripped_files=("${tmp_title_dir}"/*.mkv)
+    if (( ${#ripped_files[@]} != 1 )); then
+      die "Expected exactly one MKV for title ${tid}, found ${#ripped_files[@]} in ${tmp_title_dir}"
+    fi
+
+    printf -v title_padded '%02d' "${tid}"
+    variant_label="variant-$(variant_suffix "${variant_index}")"
+    final_name="$(sanitize_name "${SHOW_NAME}") - S${SEASON}E?? - ${variant_label} [title${title_padded}].mkv"
+    mv -- "${ripped_files[0]}" "${DEST_DIR}/${final_name}"
+
+    ripped_count=$((ripped_count + 1))
+    variant_index=$((variant_index + 1))
+    log_verbose "Completed title ${tid} -> ${final_name}"
+  done
 done
 
 log_info "Rip complete"
