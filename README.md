@@ -1,18 +1,10 @@
 # ripbot
 
-Disc ingestion + classification + automated ripping pipeline.
+ripbot is a media ingestion and analysis project.
 
-## Current Features
-- Probe disc via MakeMKV
-- Classify titles (episode vs junk)
-- Confidence scoring
-- Conditional auto-rip
+## Components
 
-## Usage
-./bin/ripAssistant.sh --help
+- ripAssistant: disc ripping and decision engine
+  - Location: bin/ripAssistant.sh
 
-## Structure
-- bin/      -> executable scripts
-- state/    -> runtime state (ignored)
-- logs/     -> logs (ignored)
-- tmp/      -> scratch (ignored)
+More modules coming soon (analysis, classification, automation).
